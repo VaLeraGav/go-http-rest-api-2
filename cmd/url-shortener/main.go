@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -28,26 +32,43 @@ func main() {
 
 	log := setupLogger(cfg.Env)
 
+	log.Info(
+		"starting url-shortener",
+		slog.String("env", cfg.Env),
+		slog.String("version", "123"),
+	)
+	log.Debug("debug messages are enabled")
+
 	storage, err := sqlite.New(cfg.StoragePath)
 	if err != nil {
 		log.Error("failed to init storage", sl.Err(err))
 		os.Exit(1)
 	}
 
-	log.Debug("debasg", slog.String("ket", "value"))
-
 	router := chi.NewRouter()
-	router.Use(middleware.RequestID)
-	// router.Use(middleware.Logger)
 
+	router.Use(middleware.RequestID)
+	router.Use(middleware.Logger)
 	router.Use(mwLogger.New(log))
 	router.Use(middleware.Recoverer)
 	router.Use(middleware.URLFormat)
 
-	log.Info("start server", slog.String("addres", cfg.Address))
+	router.Route("/url", func(r chi.Router) {
+		r.Use(middleware.BasicAuth("url-shortener", map[string]string{
+			cfg.HTTPServer.User: cfg.HTTPServer.Password,
+			"root":              "password",
+		}))
 
-	router.Post("/url", save.New(log, storage))
+		r.Post("/", save.New(log, storage))
+		// TODO: add DELETE /url/{id}
+	})
+
 	router.Get("/{alias}", redirect.New(log, storage))
+
+	log.Info("starting server", slog.String("address", cfg.Address))
+
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
 	srv := &http.Server{
 		Addr:         cfg.Address,
@@ -57,12 +78,30 @@ func main() {
 		IdleTimeout:  cfg.HTTPServer.IdleTimeout,
 	}
 
-	if err := srv.ListenAndServe(); err != nil {
-		log.Error("failed to start server")
-	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil {
+			log.Error("failed to start server")
+		}
+	}()
 
 	log.Info("server started")
 
+	<-done
+	log.Info("stopping server")
+
+	// TODO: move timeout to config
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Error("failed to stop server", sl.Err(err))
+
+		return
+	}
+
+	// TODO: close storage
+
+	log.Info("server stopped")
 }
 
 func setupLogger(env string) *slog.Logger {
@@ -71,9 +110,6 @@ func setupLogger(env string) *slog.Logger {
 	switch env {
 	case envLocal:
 		log = setupPrettySlog()
-		// log = slog.New(
-		// 	slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}),
-		// )
 	case envDev:
 		log = slog.New(
 			slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}),
